@@ -7,161 +7,275 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 export TZ=Asia/Jakarta
+
 declare -a backup_targets
+declare -a backup_labels
 declare remote_name
 declare remote_folder
+declare schedule_type
 declare target_hour
 declare target_minute
+declare interval_hours
 declare auto_delete
 declare -A last_successful_remote_filename
 
+die() { echo -e "${RED}$1${NC}"; exit 1; }
+
+command -v rclone >/dev/null 2>&1 || die "rclone not found. Install rclone first."
+command -v zip >/dev/null 2>&1 || die "zip not found. Install with: apt install -y zip"
+
+normalize_remote_folder() {
+  if [[ -z "$remote_folder" ]]; then
+    remote_folder=""
+    return
+  fi
+  remote_folder="${remote_folder#/}"
+  remote_folder="${remote_folder%/}"
+}
+
+remote_path() {
+  if [[ -z "$remote_folder" ]]; then
+    printf "%s:" "$remote_name"
+  else
+    printf "%s:%s" "$remote_name" "$remote_folder"
+  fi
+}
+
+resolve_path() {
+  local input="$1"
+  if [[ "$input" == /* ]]; then
+    printf "%s" "$input"
+    return 0
+  fi
+  if [[ -e "/root/$input" ]]; then
+    printf "%s" "/root/$input"
+    return 0
+  fi
+  if [[ -e "$PWD/$input" ]]; then
+    printf "%s" "$PWD/$input"
+    return 0
+  fi
+  printf "%s" "/root/$input"
+  return 0
+}
+
 configure_backup() {
+  while true; do
+    backup_targets=()
+    backup_labels=()
+
     while true; do
-        backup_targets=()
-
-        while true; do
-            read -p "$(echo -e "${BLUE}How much data will be backed up?: ${NC}")" count
-            if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
-                break
-            else
-                echo -e "${RED}=> Invalid input. Please enter a positive number.${NC}"
-            fi
-        done
-
-        for (( i=1; i<=count; i++ )); do
-            while true; do
-                read -p "$(echo -e "${BLUE}File-$i: ${NC}")" dir_input
-                if [[ "$dir_input" == /* ]]; then
-                    target_path="$dir_input"
-                else
-                    target_path="/root/$dir_input"
-                fi
-                
-                if [ -d "$target_path" ]; then
-                    backup_targets+=("$target_path")
-                    break
-                else
-                    echo -e "${RED}=> Error: Directory '$target_path' not found. Please try again.${NC}"
-                fi
-            done
-        done
-
-        read -p "$(echo -e "${BLUE}Name of remote rclone: ${NC}")" remote_name
-        read -p "$(echo -e "${BLUE}Name of folder connected to remote: ${NC}")" remote_folder
-
-        echo -e "${BLUE}What time will the files be backed up?${NC}"
-        while true; do
-            read -p "$(echo -e "${BLUE}  hours (0-23): ${NC}")" target_hour
-            if [[ "$target_hour" =~ ^([0-9]|1[0-9]|2[0-3])$ ]]; then
-                break
-            else
-                echo -e "${RED}=> Invalid input. Please enter an hour between 0 and 23.${NC}"
-            fi
-        done
-        
-        while true; do
-            read -p "$(echo -e "${BLUE}  minutes (0-59): ${NC}")" target_minute
-            if [[ "$target_minute" =~ ^([0-9]|[1-5][0-9])$ ]]; then
-                break
-            else
-                echo -e "${RED}=> Invalid input. Please enter minutes between 0 and 59.${NC}"
-            fi
-        done
-
-        while true; do
-            read -p "$(echo -e "${BLUE}Allow auto delete old backup files? (y/n) ${NC}")" confirm_delete
-            if [[ "$confirm_delete" =~ ^[Yy]$ ]]; then
-                auto_delete="yes"
-                break
-            elif [[ "$confirm_delete" =~ ^[Nn]$ ]]; then
-                auto_delete="no"
-                break
-            else
-                echo -e "${RED}=> Invalid input. Please enter y or n.${NC}"
-            fi
-        done
-
-        formatted_minute=$(printf "%02d" $target_minute)
-        echo -e "\n${YELLOW}--- Backup Configuration Summary ---${NC}"
-        echo "Files to be backed up:"
-        for item in "${backup_targets[@]}"; do
-            echo "  - $item"
-        done
-        echo "Rclone Remote: $remote_name"
-        echo "Remote Folder: $remote_folder"
-        echo "Daily Backup Time: Around ${target_hour}:${formatted_minute}"
-        echo "Auto-delete old backups: $auto_delete"
-        echo -e "${YELLOW}------------------------------------${NC}"
-
-        read -p "$(echo -e "${BLUE}Save data? (y/n) ${NC}")" confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            break
-        else
-            echo -e "\n${YELLOW}Configuration not saved. Restarting setup...${NC}\n"
-        fi
+      read -p "$(echo -e "${BLUE}How much data will be backed up?: ${NC}")" count
+      if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then break; fi
+      echo -e "${RED}=> Invalid input. Please enter a positive number.${NC}"
     done
+
+    for (( i=1; i<=count; i++ )); do
+      while true; do
+        read -r -p "$(echo -e "${BLUE}Target-$i (path or name): ${NC}")" input
+        target_path="$(resolve_path "$input")"
+        if [[ -e "$target_path" ]]; then
+          backup_targets+=("$target_path")
+          backup_labels+=("$(basename "$target_path")")
+          break
+        else
+          echo -e "${RED}=> Not found: '$target_path'. Use absolute path (starts with /) or ensure it exists.${NC}"
+        fi
+      done
+    done
+
+    while true; do
+      read -r -p "$(echo -e "${BLUE}Rclone remote name: ${NC}")" remote_name
+      [[ -n "$remote_name" ]] && break
+      echo -e "${RED}=> Remote name cannot be empty.${NC}"
+    done
+
+    read -r -p "$(echo -e "${BLUE}Remote folder path (leave empty for root): ${NC}")" remote_folder
+    normalize_remote_folder
+
+    while true; do
+      echo -e "${BLUE}Backup schedule:${NC}"
+      echo -e "  1) Every day"
+      echo -e "  2) Every hour"
+      read -r -p "$(echo -e "${BLUE}Choose (1/2): ${NC}")" sched_choice
+      if [[ "$sched_choice" == "1" ]]; then schedule_type="daily"; break; fi
+      if [[ "$sched_choice" == "2" ]]; then schedule_type="hourly"; break; fi
+      echo -e "${RED}=> Invalid choice. Please enter 1 or 2.${NC}"
+    done
+
+    if [[ "$schedule_type" == "daily" ]]; then
+      echo -e "${BLUE}What time will the files be backed up (daily)?${NC}"
+      while true; do
+        read -r -p "$(echo -e "${BLUE}  hours (0-23): ${NC}")" target_hour
+        [[ "$target_hour" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] && break
+        echo -e "${RED}=> Invalid input. Please enter an hour between 0 and 23.${NC}"
+      done
+      while true; do
+        read -r -p "$(echo -e "${BLUE}  minutes (0-59): ${NC}")" target_minute
+        [[ "$target_minute" =~ ^([0-9]|[1-5][0-9])$ ]] && break
+        echo -e "${RED}=> Invalid input. Please enter minutes between 0 and 59.${NC}"
+      done
+    else
+      while true; do
+        read -r -p "$(echo -e "${BLUE}How many hours per backup cycle? (1-10): ${NC}")" interval_hours
+        if [[ "$interval_hours" =~ ^[0-9]+$ ]] && (( interval_hours >= 1 && interval_hours <= 10 )); then break; fi
+        echo -e "${RED}=> Invalid input. Please enter a number between 1 and 10.${NC}"
+      done
+    fi
+
+    while true; do
+      read -r -p "$(echo -e "${BLUE}Allow auto delete old backup files? (y/n): ${NC}")" confirm_delete
+      if [[ "$confirm_delete" =~ ^[Yy]$ ]]; then auto_delete="yes"; break; fi
+      if [[ "$confirm_delete" =~ ^[Nn]$ ]]; then auto_delete="no"; break; fi
+      echo -e "${RED}=> Invalid input. Please enter y or n.${NC}"
+    done
+
+    echo -e "\n${YELLOW}--- Backup Configuration Summary ---${NC}"
+    echo "Targets:"
+    for idx in "${!backup_targets[@]}"; do
+      echo "  - ${backup_targets[$idx]}"
+    done
+    echo "Rclone Remote: $remote_name"
+    echo "Remote Folder: ${remote_folder:-/}"
+    if [[ "$schedule_type" == "daily" ]]; then
+      printf "Schedule: Every day at %02d:%02d\n" "$target_hour" "$target_minute"
+    else
+      echo "Schedule: Every ${interval_hours} hour(s)"
+    fi
+    echo "Auto-delete old backups: $auto_delete"
+    echo -e "${YELLOW}------------------------------------${NC}"
+
+    read -r -p "$(echo -e "${BLUE}Save data? (y/n): ${NC}")" confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] && break
+    echo -e "\n${YELLOW}Configuration not saved. Restarting setup...${NC}\n"
+  done
+}
+
+make_zip_name() {
+  local label="$1"
+  if [[ "$schedule_type" == "daily" ]]; then
+    printf "day-%s_backup_%s.zip" "$label" "$(date +%Y-%-m-%d)"
+  else
+    printf "hour-%s_backup_%s.zip" "$label" "$(date +%Y-%-m-%d-%H:%M)"
+  fi
+}
+
+zip_target() {
+  local target="$1"
+  local zip_path="$2"
+
+  rm -f "$zip_path" >/dev/null 2>&1
+
+  if [[ -d "$target" ]]; then
+    zip -r -q "$zip_path" "$target"
+    return $?
+  fi
+
+  if [[ -f "$target" ]]; then
+    zip -q "$zip_path" "$target"
+    return $?
+  fi
+
+  return 1
+}
+
+upload_with_retries() {
+  local local_file="$1"
+  local remote_dest="$2"
+  local tries=3
+  local n=1
+  while (( n <= tries )); do
+    rclone copyto "$local_file" "$remote_dest" >/dev/null 2>&1
+    [[ $? -eq 0 ]] && return 0
+    sleep $((n * 3))
+    ((n++))
+  done
+  return 1
 }
 
 run_backup_cycle() {
-    echo -e "${YELLOW}--- Starting new backup cycle... ---${NC}"
-    for target in "${backup_targets[@]}"; do
-        file_basename=$(basename "$target")
-        timestamp=$(date +%Y%m%d%H%M%S)
-        
-        new_local_zip="/root/${file_basename}_backup_${timestamp}.zip"
-        new_remote_filename="${file_basename}_backup_${timestamp}.zip"
-        old_remote_filename=${last_successful_remote_filename[$file_basename]}
+  echo -e "${YELLOW}--- Starting new backup cycle... ---${NC}"
 
-        echo -e "$(date '+%Y-%m-%d %H:%M:%S') - Creating local zip for '$file_basename'..."
-        zip -r "$new_local_zip" "$target" > /dev/null 2>&1
-        
-        echo -e "$(date '+%Y-%m-%d %H:%M:%S') - Uploading to remote..."
-        rclone copy "$new_local_zip" "$remote_name:$remote_folder/" > /dev/null 2>&1
+  local rpath
+  rpath="$(remote_path)"
 
-        if [ $? -eq 0 ]; then
-            echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${GREEN}The backup process for the '$file_basename' file was successful.${NC}"
-            last_successful_remote_filename[$file_basename]=$new_remote_filename
-            
-            if [[ "$auto_delete" == "yes" && -n "$old_remote_filename" ]]; then
-                echo -e "${YELLOW}--> Deleting old remote backup: $old_remote_filename${NC}"
-                rclone delete "$remote_name:$remote_folder/$old_remote_filename" > /dev/null 2>&1
-            fi
-        else
-            echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${RED}The backup process for the '$file_basename' file FAILED.${NC}"
-        fi
-        
-        echo -e "$(date '+%Y-%m-%d %H:%M:%S') - Deleting local zip file: $new_local_zip"
-        rm "$new_local_zip"
-    done
+  for idx in "${!backup_targets[@]}"; do
+    local target="${backup_targets[$idx]}"
+    local label="${backup_labels[$idx]}"
+
+    if [[ ! -e "$target" ]]; then
+      echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${RED}SKIP: Target not found: $target${NC}"
+      continue
+    fi
+
+    local zip_filename
+    zip_filename="$(make_zip_name "$label")"
+
+    local local_zip="/root/${zip_filename}"
+    local remote_file="${rpath}/${zip_filename}"
+    local old_remote="${last_successful_remote_filename[$label]}"
+
+    echo -e "$(date '+%Y-%m-%d %H:%M:%S') - Zipping '$label' from: $target"
+    if ! zip_target "$target" "$local_zip"; then
+      echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${RED}ZIP FAILED for '$label'.${NC}"
+      rm -f "$local_zip" >/dev/null 2>&1
+      continue
+    fi
+
+    if [[ ! -s "$local_zip" ]]; then
+      echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${RED}ZIP EMPTY for '$label'.${NC}"
+      rm -f "$local_zip" >/dev/null 2>&1
+      continue
+    fi
+
+    echo -e "$(date '+%Y-%m-%d %H:%M:%S') - Uploading to: ${remote_file}"
+    if upload_with_retries "$local_zip" "$remote_file"; then
+      echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${GREEN}Backup SUCCESS for '$label'.${NC}"
+      last_successful_remote_filename[$label]="$zip_filename"
+
+      if [[ "$auto_delete" == "yes" && -n "$old_remote" && "$old_remote" != "$zip_filename" ]]; then
+        echo -e "${YELLOW}--> Deleting old remote backup: $old_remote${NC}"
+        rclone deletefile "${rpath}/${old_remote}" >/dev/null 2>&1
+      fi
+    else
+      echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${RED}Backup FAILED for '$label'.${NC}"
+    fi
+
+    rm -f "$local_zip" >/dev/null 2>&1
+  done
+}
+
+sleep_until_next_daily_run() {
+  local now_epoch target_epoch next_epoch sleep_seconds
+  now_epoch=$(date +%s)
+  target_epoch=$(date -d "today ${target_hour}:${target_minute}" +%s 2>/dev/null)
+  if (( now_epoch >= target_epoch )); then
+    next_epoch=$(date -d "tomorrow ${target_hour}:${target_minute}" +%s)
+  else
+    next_epoch=$target_epoch
+  fi
+  sleep_seconds=$((next_epoch - now_epoch))
+  (( sleep_seconds < 0 )) && sleep_seconds=0
+  echo -e "${YELLOW}--- Cycle complete. Next backup is scheduled for: $(date -d "@${next_epoch}") ---${NC}"
+  sleep "$sleep_seconds"
+}
+
+sleep_until_next_hourly_run() {
+  local sleep_seconds=$((interval_hours * 3600))
+  echo -e "${YELLOW}--- Cycle complete. Next backup is scheduled in: ${interval_hours} hour(s) ---${NC}"
+  sleep "$sleep_seconds"
 }
 
 configure_backup
 
 echo -e "\n${GREEN}Configuration saved. Starting the first backup process now...${NC}"
-
 run_backup_cycle
 
-SCHEDULING_THRESHOLD_SECONDS=1800
-
 while true; do
-    current_epoch=$(date +%s)
-    target_today_epoch=$(date -d "today ${target_hour}:${target_minute}" +%s)
-
-    if (( current_epoch > target_today_epoch )); then
-        next_run_epoch=$(date -d "tomorrow ${target_hour}:${target_minute}" +%s)
-    else
-        next_run_epoch=$target_today_epoch
-    fi
-
-    sleep_duration=$((next_run_epoch - current_epoch))
-    if (( sleep_duration < 0 )); then
-        sleep_duration=0
-    fi
-    
-    next_run_human=$(date -d "@${next_run_epoch}")
-
-    echo -e "${YELLOW}--- Cycle complete. Next backup is scheduled for: $next_run_human ---${NC}"
-    sleep "$sleep_duration"
-    
-    run_backup_cycle
+  if [[ "$schedule_type" == "daily" ]]; then
+    sleep_until_next_daily_run
+  else
+    sleep_until_next_hourly_run
+  fi
+  run_backup_cycle
 done
