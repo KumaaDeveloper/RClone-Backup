@@ -43,18 +43,37 @@ remote_path() {
 
 resolve_path() {
   local input="$1"
+
+  if [[ -z "$input" ]]; then
+    printf "%s" "/root/"
+    return 0
+  fi
+
   if [[ "$input" == /* ]]; then
     printf "%s" "$input"
     return 0
   fi
-  if [[ -e "/root/$input" ]]; then
-    printf "%s" "/root/$input"
+
+  if [[ "$input" == *"/"* && -e "/$input" ]]; then
+    printf "%s" "/$input"
     return 0
   fi
+
   if [[ -e "$PWD/$input" ]]; then
     printf "%s" "$PWD/$input"
     return 0
   fi
+
+  if [[ -e "/root/$input" ]]; then
+    printf "%s" "/root/$input"
+    return 0
+  fi
+
+  if [[ "$input" == *"/"* ]]; then
+    printf "%s" "/$input"
+    return 0
+  fi
+
   printf "%s" "/root/$input"
   return 0
 }
@@ -154,9 +173,9 @@ configure_backup() {
 make_zip_name() {
   local label="$1"
   if [[ "$schedule_type" == "daily" ]]; then
-    printf "day-%s_backup_%s.zip" "$label" "$(date +%Y-%-m-%d)"
+    printf "day-%s_backup_%s.zip" "$label" "$(date +%Y-%m-%d)"
   else
-    printf "hour-%s_backup_%s.zip" "$label" "$(date +%Y-%-m-%d-%H:%M)"
+    printf "hour-%s_backup_%s.zip" "$label" "$(date +%Y-%m-%d-%H%M)"
   fi
 }
 
@@ -167,12 +186,18 @@ zip_target() {
   rm -f "$zip_path" >/dev/null 2>&1
 
   if [[ -d "$target" ]]; then
-    zip -r -q "$zip_path" "$target"
+    local parent base
+    parent="$(dirname "$target")"
+    base="$(basename "$target")"
+    ( cd "$parent" && zip -r -q "$zip_path" "$base" )
     return $?
   fi
 
   if [[ -f "$target" ]]; then
-    zip -q "$zip_path" "$target"
+    local parent base
+    parent="$(dirname "$target")"
+    base="$(basename "$target")"
+    ( cd "$parent" && zip -q "$zip_path" "$base" )
     return $?
   fi
 
@@ -191,6 +216,33 @@ upload_with_retries() {
     ((n++))
   done
   return 1
+}
+
+delete_old_backups_for_label() {
+  local label="$1"
+  local keep_filename="$2"
+  local rpath="$3"
+
+  local prefix
+  if [[ "$schedule_type" == "daily" ]]; then
+    prefix="day-${label}_backup_"
+  else
+    prefix="hour-${label}_backup_"
+  fi
+
+  local files
+  files="$(rclone lsf "$rpath" --files-only --max-depth 1 2>/dev/null | tr -d '\r')"
+  [[ -z "$files" ]] && return 0
+
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ "$f" == "$keep_filename" ]] && continue
+    [[ "$f" == ${prefix}*.zip ]] || continue
+    echo -e "${YELLOW}--> Deleting old remote backup: $f${NC}"
+    rclone deletefile "${rpath}/${f}" >/dev/null 2>&1
+  done <<< "$files"
+
+  return 0
 }
 
 run_backup_cycle() {
@@ -213,7 +265,6 @@ run_backup_cycle() {
 
     local local_zip="/root/${zip_filename}"
     local remote_file="${rpath}/${zip_filename}"
-    local old_remote="${last_successful_remote_filename[$label]}"
 
     echo -e "$(date '+%Y-%m-%d %H:%M:%S') - Zipping '$label' from: $target"
     if ! zip_target "$target" "$local_zip"; then
@@ -233,9 +284,8 @@ run_backup_cycle() {
       echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${GREEN}Backup SUCCESS for '$label'.${NC}"
       last_successful_remote_filename[$label]="$zip_filename"
 
-      if [[ "$auto_delete" == "yes" && -n "$old_remote" && "$old_remote" != "$zip_filename" ]]; then
-        echo -e "${YELLOW}--> Deleting old remote backup: $old_remote${NC}"
-        rclone deletefile "${rpath}/${old_remote}" >/dev/null 2>&1
+      if [[ "$auto_delete" == "yes" ]]; then
+        delete_old_backups_for_label "$label" "$zip_filename" "$rpath"
       fi
     else
       echo -e "$(date '+%Y-%m-%d %H:%M:%S') - ${RED}Backup FAILED for '$label'.${NC}"
